@@ -197,19 +197,72 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
+    """
+    渴望执行的注意力前向传播函数。
+
+    Args:
+        module (nn.Module): 包含注意力机制的模块，例如 LlamaAttention。
+        query (torch.Tensor): 查询张量，形状通常为 (batch_size, num_heads, seq_len, head_dim)。
+        key (torch.Tensor): 键张量，形状通常为 (batch_size, num_key_value_heads, seq_len, head_dim)。
+        value (torch.Tensor): 值张量，形状通常为 (batch_size, num_key_value_heads, seq_len, head_dim)。
+        attention_mask (Optional[torch.Tensor]): 注意力掩码，用于屏蔽不应参与注意力计算的 token。
+        scaling (float): 缩放因子，通常为 head_dim 的平方根的倒数，用于缩放注意力权重。
+        dropout (float): Dropout 概率，用于防止过拟合。
+        **kwargs: 其他关键字参数。
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: 一个包含注意力输出和注意力权重的元组。
+            - 注意力输出 (attn_output): 形状通常为 (batch_size, seq_len, num_heads * head_dim)。
+            - 注意力权重 (attn_weights): 形状通常为 (batch_size, num_heads, seq_len, seq_len)。
+    """
+    # 1. 扩展 Key 和 Value 以匹配 Query 的 Head 数量
     key_states = repeat_kv(key, module.num_key_value_groups)
+    #   - `repeat_kv` 函数：将 key 和 value 张量的 head 维度进行重复，以适应 Multi-Query Attention 或者 Grouped-Query Attention。
+    #   - `module.num_key_value_groups`：表示 key 和 value 共享的 head 组的数量。
+    #   -  目的: 为了让 key 和 value 的 head 数量与 query 的 head 数量相匹配，以便进行后续的注意力计算。
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    # 2. 计算注意力权重
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    #   - `torch.matmul(query, key_states.transpose(2, 3))`：计算 query 和 key 的点积，得到注意力 logits。
+    #   - `key_states.transpose(2, 3)`：将 key 张量的最后两个维度转置，以便进行矩阵乘法。
+    #   - `scaling`：缩放因子，用于缩小点积的值，防止 softmax 后的梯度消失。
+
+    # 3. 应用注意力掩码 (如果存在) key_states shape 为 (batch_size, num_key_value_heads, seq_len, head_dim)
+
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        #   - `attention_mask`：注意力掩码，用于屏蔽不应该参与注意力计算的 token，例如 padding token。
+        #   - `causal_mask`：因果掩码，用于确保模型只能关注到当前位置之前的 token，用于自回归生成任务。
+        #   - `attn_weights + causal_mask`：将注意力掩码添加到注意力权重上，实现屏蔽的效果。
         attn_weights = attn_weights + causal_mask
 
+    # 4. 对注意力权重进行 Softmax 归一化
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
+    #   - `nn.functional.softmax(attn_weights, dim=-1)`：对注意力权重进行 softmax 归一化，使其成为概率分布。
+    #   - `dim=-1`：沿着最后一个维度进行 softmax 归一化，即对每个 query 位置的 key 位置进行归一化。
+    #   - `dtype=torch.float32`：将注意力权重转换为 float32 类型，保证数值稳定性。
+    #   - `.to(query.dtype)`: 将数据类型转换为与query张量相同的类型，确保计算的一致性。
 
+    # 5. 应用 Dropout (如果需要)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    #   - `nn.functional.dropout(attn_weights, p=dropout, training=module.training)`：对注意力权重应用 dropout，防止过拟合。
+    #   - `p=dropout`：dropout 概率。
+    #   - `training=module.training`：只有在训练模式下才应用 dropout。
+
+    # 6. 计算注意力输出
+    attn_output = torch.matmul(attn_weights, value_states)
+    #   - `torch.matmul(attn_weights, value_states)`：将注意力权重与 value 张量相乘，得到注意力输出。
+    #   -  每个query会根据权重，关注不同的value信息。
+
+    # 7. 调整输出形状
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    #   - `attn_output.transpose(1, 2)`：将注意力输出的维度转置，使其形状变为 (batch_size, seq_len, num_heads, head_dim)。
+    #   - `contiguous()`:  确保张量在内存中是连续存储的，避免一些潜在的问题。
+    #     - 对于很多tensor操作，比如transpose()，view()等等，可能会导致tensor在内存中变成不连续存储。
+    #     - 而如果后续你要调用一些需要连续存储的tensor的操作，就需要先调用contiguous()。
+
+    # 8. 返回注意力输出和注意力权重
     return attn_output, attn_weights
 
 
@@ -217,27 +270,50 @@ class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: LlamaConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+        """
+        构造函数，初始化 LlamaAttention 层。
+
+        Args:
+            config (LlamaConfig): Llama 模型的配置对象。
+            layer_idx (int): 当前 Attention 层在整个模型中的索引，用于 Cache 的管理。
+        """
+        super().__init__()  # 调用父类的构造函数。
+        self.config = config  # 存储模型配置。
+        self.layer_idx = layer_idx  # 存储当前层的索引。
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        #   - `head_dim`：每个注意力头的维度。如果配置中指定了 `head_dim`，则使用它；否则，通过 `hidden_size // config.num_attention_heads` 计算得到。
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
+        #   - `num_key_value_groups`：在 Grouped-Query Attention (GQA) 或 Multi-Query Attention (MQA) 中，key 和 value 头共享的组数。
+        #   - 目的: 降低计算量和模型大小。
+        self.scaling = self.head_dim**-0.5  # 缩放因子，用于缩放注意力权重。等于 head_dim 的平方根的倒数。
+        self.attention_dropout = config.attention_dropout  # 注意力 dropout 概率，用于防止过拟合。
+        self.is_causal = True  # 是否是因果注意力，用于自回归生成任务。
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
+        #   - `q_proj`：线性层，用于将 hidden_states 转换为 query。
+        #   - 输入维度：`config.hidden_size`。
+        #   - 输出维度：`config.num_attention_heads * self.head_dim`，表示所有注意力头的 query 维度。
+        #   - `bias=config.attention_bias`：是否使用偏置项。
         self.k_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
+        #   - `k_proj`：线性层，用于将 hidden_states 转换为 key。
+        #   - 输入维度：`config.hidden_size`。
+        #   - 输出维度：`config.num_key_value_heads * self.head_dim`，表示所有 key-value 头的 key 维度。
         self.v_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
+        #   - `v_proj`：线性层，用于将 hidden_states 转换为 value。
+        #   - 输入维度：`config.hidden_size`。
+        #   - 输出维度：`config.num_key_value_heads * self.head_dim`，表示所有 key-value 头的 value 维度。
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
+        #   - `o_proj`：线性层，用于将注意力输出转换为隐藏状态。
+        #   - 输入维度：`config.num_attention_heads * self.head_dim`，表示所有注意力头的维度之和。
+        #   - 输出维度：`config.hidden_size`。
 
     def forward(
         self,
@@ -248,23 +324,51 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        """
+        前向传播函数，计算 Attention 层的输出。
 
+        Args:
+            hidden_states (torch.Tensor): 输入的隐藏状态，形状为 (batch_size, sequence_length, hidden_size)。
+            position_embeddings (Tuple[torch.Tensor, torch.Tensor]): 位置嵌入，包括 cos 和 sin 值。
+            attention_mask (Optional[torch.Tensor]): 注意力掩码，用于屏蔽不应参与注意力计算的 token。
+            past_key_value (Optional[Cache]): 过去的 key 和 value 状态，用于加速推理。
+            cache_position (Optional[torch.LongTensor]): 缓存位置信息，用于更新缓存。
+            **kwargs: 其他关键字参数，用于传递给 FlashAttention 等注意力机制。
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+                包含注意力输出、注意力权重（如果需要）和过去的 key/value 状态（如果使用缓存）的元组。
+        """
+        # 1. 获取输入形状
+        input_shape = hidden_states.shape[:-1]  # 输入形状， (batch_size, sequence_length)。
+        hidden_shape = (*input_shape, -1, self.head_dim)  # 隐藏层形状，(batch_size, sequence_length, num_heads, head_dim)。
+
+        # 2. 线性变换得到 Query, Key, Value
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        #   - `self.q_proj(hidden_states)`: 将输入 `hidden_states` 通过线性层 `q_proj` 投影到 Query 空间。
+        #   - `.view(hidden_shape)`:  将输出张量reshape成想要的形状 `hidden_shape`, 方便后续计算
+        #   - `.transpose(1, 2)`: 交换维度 1 和 2，使得 head 维度放到 seq_len 前面。
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        #   - 类似 `query_states`，不过这里是转换到 Key 空间。
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        #   - 类似 `query_states`，不过这里是转换到 Value 空间。
 
-        cos, sin = position_embeddings
+        # 3. 应用 RoPE (旋转位置编码)
+        cos, sin = position_embeddings  # 从 position_embeddings 中获取 cos 和 sin 值。
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        #   - `apply_rotary_pos_emb`：应用 RoPE 到 query 和 key 张量。
 
+        # 4. 更新 Cache (如果使用)
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            #   - `cache_kwargs`：存储缓存相关的参数，包括 RoPE 的 sin 和 cos 值以及缓存位置。
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            #   - `past_key_value.update(...)`：更新 Cache，并将更新后的 key 和 value 状态返回。
+            #   - `self.layer_idx`：当前 Attention 层的索引，用于 Cache 的管理。
 
+        # 5. 选择 Attention 实现方式
         attention_interface: Callable = eager_attention_forward
-
+        #   - `attention_interface`：一个 Callable 对象，指向具体的 Attention 实现函数。默认使用 `eager_attention_forward`。
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
@@ -273,7 +377,10 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        #    - 根据模型配置 `self.config._attn_implementation` 选择不同的 Attention 实现方式。
+        #    - `ALL_ATTENTION_FUNCTIONS`：一个字典，存储了各种 Attention 实现方式。
 
+        # 6. 计算 Attention 输出和权重
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -284,9 +391,18 @@ class LlamaAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+        #   - 调用具体的 Attention 实现函数 `attention_interface` 计算 Attention 输出和权重。
 
+        # 7. 调整 Attention 输出的形状
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        #   - 将 Attention 输出 reshape 成 `(batch_size, sequence_length, hidden_size)` 的形状。
+        #   - `contiguous()`：确保张量在内存中是连续存储的。
+
+        # 8. 通过线性层进行输出投影
         attn_output = self.o_proj(attn_output)
+        #   - `self.o_proj(attn_output)`：将 Attention 输出通过线性层 `o_proj` 投影到最终的输出空间。
+
+        # 9. 返回结果
         return attn_output, attn_weights
 
 
@@ -364,32 +480,128 @@ LLAMA_START_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaPreTrainedModel(PreTrainedModel):
-    config_class = LlamaConfig
-    base_model_prefix = "model"
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["LlamaDecoderLayer"]
-    _skip_keys_device_placement = ["past_key_values"]
-    _supports_flash_attn_2 = True
-    _supports_sdpa = True
-    _supports_flex_attn = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
-    _supports_static_cache = True
-    _supports_attention_backend = True
+class LlamaDecoderLayer(GradientCheckpointingLayer):
+    """
+    Llama 解码器层，是 Llama 模型的核心 building block。
+    它包含自注意力机制、多层感知机 (MLP) 和 RMSNorm 归一化层，并通过残差连接来提高训练效率。
+    该层继承自 GradientCheckpointingLayer，支持梯度检查点技术，以减少内存占用。
+    """
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        """
+        构造函数，初始化 LlamaDecoderLayer。
 
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, LlamaRMSNorm):
-            module.weight.data.fill_(1.0)
+        Args:
+            config (LlamaConfig): 模型的配置对象。
+            layer_idx (int): 当前层在整个模型中的索引，用于 Cache 的管理以及 RoPE 的计算。
+        """
+        super().__init__()  # 调用父类的构造函数，确保 GradientCheckpointingLayer 的初始化逻辑被执行。
+        # 1. 隐藏层大小
+        self.hidden_size = config.hidden_size
+        #   - `hidden_size`：指定隐藏层的维度。
+
+        # 2. 自注意力层
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        #   -  `self_attn`：LlamaAttention 类的实例，用于计算输入序列的自注意力。
+
+        # 3. MLP 层
+        self.mlp = LlamaMLP(config)
+        #   - `mlp`：LlamaMLP 类的实例，用于对自注意力层的输出进行非线性变换。
+
+        # 4. 输入归一化层
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #   - `input_layernorm`：LlamaRMSNorm 类的实例，用于对输入进行归一化。
+        #   - RMSNorm 是一种 Layer Normalization 的变体，能够稳定训练过程。
+
+        # 5. 注意力输出归一化层
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #   - `post_attention_layernorm`：LlamaRMSNorm 类的实例，用于对自注意力层的输出进行归一化。
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        前向传播函数，计算 LlamaDecoderLayer 的输出。
+
+        Args:
+            hidden_states (torch.Tensor): 输入的隐藏状态，形状为 (batch_size, sequence_length, hidden_size)。
+            attention_mask (Optional[torch.Tensor]): 注意力掩码，用于屏蔽不应参与注意力计算的 token。
+            position_ids (Optional[torch.LongTensor]): 位置 IDs，形状为 (batch_size, sequence_length)。
+            past_key_value (Optional[Cache]): 过去的 key 和 value，用于加速推理。
+            output_attentions (Optional[bool]): 是否输出注意力权重。
+            use_cache (Optional[bool]): 是否使用缓存。
+            cache_position (Optional[torch.LongTensor]): 缓存位置，用于更新缓存。
+            position_embeddings (Optional[Tuple[torch.Tensor, torch.Tensor]]): 位置嵌入 (RoPE)，cos 和 sin 值。
+            **kwargs: 其他关键字参数，用于传递给 FlashAttention 等注意力机制。
+
+        Returns:
+            Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+                包含解码器层的输出和注意力权重（如果需要）的元组。
+        """
+        # 1. 残差连接
+        residual = hidden_states
+        #   -  将输入 `hidden_states` 存储在 `residual` 变量中，用于后面的残差连接。
+
+        # 2. 输入归一化
+        hidden_states = self.input_layernorm(hidden_states)
+        #   - 使用 `self.input_layernorm` 对输入进行归一化。
+
+        # 3. 自注意力
+        hidden_states, self_attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        #   -  将归一化后的输入 `hidden_states` 传递给自注意力层 `self.self_attn`，并获取注意力输出和注意力权重。
+
+        # 4. 残差连接
+        hidden_states = residual + hidden_states
+        #   - 将自注意力层的输出与原始输入 `residual` 相加，实现残差连接。
+        #   - 残差连接有助于缓解梯度消失问题，并加速模型训练。
+
+        # 5. 全连接层
+        residual = hidden_states
+        #   -  再次将输入存储在 `residual` 变量中，用于后面的残差连接。
+
+        # 6. 注意力输出归一化
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        #   - 使用 `self.post_attention_layernorm` 对自注意力层的输出进行归一化。
+
+        # 7. MLP
+        hidden_states = self.mlp(hidden_states)
+        #   -  将归一化后的输入传递给 MLP 层 `self.mlp`，进行非线性变换。
+
+        # 8. 残差连接
+        hidden_states = residual + hidden_states
+        #   - 将 MLP 层的输出与残差 `residual` 相加，实现残差连接。
+
+        # 9. 构建输出
+        outputs = (hidden_states,)
+        #   - 创建一个包含隐藏状态 `hidden_states` 的元组作为输出。
+        #   -   `hidden_states`：是解码器层的最终输出，用于传递给下一层或进行后续处理。
+
+        # 10. 如果需要，添加注意力权重到输出
+        if output_attentions:
+            outputs += (self_attn_weights,)
+            #    - 如果 `output_attentions` 为 True，则将自注意力权重 `self_attn_weights` 添加到输出元组中。
+
+        # 11. 返回输出
+        return outputs
+        #   - 返回包含解码器层输出的元组。
 
 
 LLAMA_INPUTS_DOCSTRING = r"""
@@ -461,6 +673,90 @@ LLAMA_INPUTS_DOCSTRING = r"""
             the complete sequence length.
 """
 
+@add_start_docstrings(
+    "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
+    LLAMA_START_DOCSTRING,
+)
+class LlamaPreTrainedModel(PreTrainedModel):
+    """
+    Llama 预训练模型基类。
+    所有 Llama 模型都应继承自此类。它提供了一些通用的方法和属性，用于处理模型配置、权重初始化、设备管理和与 Hugging Face Transformers 库的集成。
+    """
+    # 1. 配置类
+    config_class = LlamaConfig
+    #   - `config_class`：指定模型使用的配置类为 `LlamaConfig`，该类定义了模型的各种参数。
+
+    # 2. 模型前缀
+    base_model_prefix = "model"
+    #   - `base_model_prefix`：指定模型中核心模块的前缀，用于区分不同的模型组件。例如，`model.embed_tokens`、`model.layers` 等。
+
+    # 3. 支持梯度检查点
+    supports_gradient_checkpointing = True
+    #   - `supports_gradient_checkpointing`：指示该模型支持梯度检查点（Gradient Checkpointing）技术。
+    #   - 梯度检查点是一种在不存储所有中间激活的情况下训练大型模型的技术，通过在反向传播过程中重新计算激活来减少内存占用。
+
+    # 4. 不分割的模块
+    _no_split_modules = ["LlamaDecoderLayer"]
+    #   - `_no_split_modules`：指定在进行模型并行化时，不进行分割的模块。
+    #   - `LlamaDecoderLayer` 作为一个整体，不应该被分割到不同的设备上，因为它内部包含了多个相互依赖的子模块。
+
+    # 5. 跳过设备放置的键
+    _skip_keys_device_placement = ["past_key_values"]
+    #   - `_skip_keys_device_placement`：在加载模型到设备时，指定跳过设备放置的键。
+    #   - `past_key_values`：用于缓存历史状态的键，通常在生成任务中使用。延迟加载可以优化初始化时间。
+
+    # 6. 对各种加速技术的支持
+    _supports_flash_attn_2 = True
+    #   - `_supports_flash_attn_2`：指示该模型支持 Flash Attention 2 技术，用于加速注意力计算。
+    _supports_sdpa = True
+    #   - `_supports_sdpa`：指示该模型支持 SDPA（Scaled Dot Product Attention），PyTorch 2.0 提供的一种加速注意力计算的方法。
+    _supports_flex_attn = True
+    #   - `_supports_flex_attn`：指示该模型支持 FlexAttention，一种更灵活的注意力机制，可以处理不同类型的 attention mask。
+
+    # 7. 对各种缓存机制的支持
+    _supports_cache_class = True
+    #   - `_supports_cache_class`：指示该模型支持自定义的缓存类，用于管理和存储历史状态。
+    _supports_quantized_cache = True
+    #   - `_supports_quantized_cache`：指示该模型支持量化缓存，用于减少缓存的内存占用。
+    _supports_static_cache = True
+    #   - `_supports_static_cache`：指示该模型支持静态缓存，一种特殊的缓存机制，可以进一步加速推理。
+
+    # 8. 支持可定制的注意力后端
+    _supports_attention_backend = True
+    #   - `_supports_attention_backend`：指示该模型支持选择不同的注意力后端实现。
+
+    def _init_weights(self, module):
+        """
+        权重初始化方法。
+        使用正态分布初始化模型的权重，并将偏置初始化为零。
+
+        Args:
+            module (nn.Module): 要初始化的模型模块。
+        """
+        # 1. 获取初始化范围
+        std = self.config.initializer_range
+        #   - 从模型配置中获取初始化范围，用于控制权重初始化的尺度。
+
+        # 2. 初始化线性层的权重和偏置
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            #   - 使用均值为 0，标准差为 `std` 的正态分布初始化线性层的权重。
+            if module.bias is not None:
+                module.bias.data.zero_()
+            #   - 如果线性层有偏置，则将其初始化为零。
+
+        # 3. 初始化嵌入层的权重，并处理 padding 索引
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            #   - 使用均值为 0，标准差为 `std` 的正态分布初始化嵌入层的权重。
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+            #   - 如果嵌入层有 `padding_idx`，则将对应位置的权重设置为零，以确保 padding token 不影响模型的计算。
+
+        # 4. 初始化 LlamaRMSNorm 层的权重
+        elif isinstance(module, LlamaRMSNorm):
+            module.weight.data.fill_(1.0)
+            #   - 将 LlamaRMSNorm 层的权重初始化为 1，保证初始状态下不影响输入。
 
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
@@ -468,36 +764,77 @@ LLAMA_INPUTS_DOCSTRING = r"""
 )
 class LlamaModel(LlamaPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
+    Transformer 解码器，由 *config.num_hidden_layers* 层组成。每层是一个 [`LlamaDecoderLayer`]。
 
     Args:
-        config: LlamaConfig
+        config: LlamaConfig，模型配置
     """
 
     def __init__(self, config: LlamaConfig):
-        super().__init__(config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        """
+        构造函数，初始化 LlamaModel。
 
+        Args:
+            config (LlamaConfig): 模型的配置对象。
+        """
+        super().__init__(config)  # 调用父类的构造函数，确保 PreTrainedModel 的初始化逻辑被执行。
+        self.padding_idx = config.pad_token_id  #  `padding_idx`：padding token 的索引，用于在嵌入层中忽略 padding token。
+        self.vocab_size = config.vocab_size  # `vocab_size`：词汇表的大小，即 token 的总数。
+
+        # 1. 嵌入层
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        #   - `nn.Embedding`：将输入 token IDs 转换为连续的向量表示。
+        #   - `config.vocab_size`：词汇表大小。
+        #   - `config.hidden_size`：嵌入向量的维度。
+        #   - `self.padding_idx`：指定 padding token 的索引，在计算损失时会被忽略。
+
+        # 2. 解码器层列表
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        #   - `nn.ModuleList`：用于存储多个 `nn.Module` 对象，并将其作为一个整体进行管理。
+        #   - `LlamaDecoderLayer(config, layer_idx)`：创建单个解码器层，`config` 是模型配置，`layer_idx` 是当前层的索引。
+        #   - `config.num_hidden_layers`：解码器层的总数，决定了模型深度。
 
-        # Initialize weights and apply final processing
+        # 3. 归一化层
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #   - `LlamaRMSNorm`：用于对最后一个隐藏层的输出进行归一化，以稳定训练并提高性能。
+        #   - `config.hidden_size`：隐藏层大小。
+        #   - `config.rms_norm_eps`：RMSNorm 中的 epsilon 值，用于防止除以零。
+
+        # 4. 旋转位置嵌入
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        #   - `LlamaRotaryEmbedding`：用于编码位置信息，提供给自注意力机制。
+
+        # 5. 梯度检查点
+        self.gradient_checkpointing = False
+        #   -  `gradient_checkpointing`：一个布尔值，指示是否启用梯度检查点技术。
+        #      - 梯度检查点是一种在不存储所有中间激活的情况下训练大型模型的技术，通过在反向传播过程中重新计算激活来减少内存占用。
+
+        # 6. 初始化权重和应用最终处理
         self.post_init()
+        #   - 调用 `post_init` 方法，初始化模型的权重，并将模型设置为评估模式。
 
     def get_input_embeddings(self):
-        return self.embed_tokens
+        """
+        获取输入嵌入。
+
+        Returns:
+            nn.Embedding: 输入嵌入层。
+        """
+        return self.embed_tokens  # 返回模型的嵌入层。
 
     def set_input_embeddings(self, value):
-        self.embed_tokens = value
+        """
+        设置输入嵌入。
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+        Args:
+            value (nn.Embedding): 新的嵌入层。
+        """
+        self.embed_tokens = value  # 将模型的嵌入层替换为新的嵌入层。
+
+    @can_return_tuple  # 指示该函数可以返回元组。
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)  # 添加输入文档字符串。
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -511,57 +848,108 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        """
+        前向传播函数，计算 LlamaModel 的输出。
+
+        Args:
+            input_ids (Optional[torch.LongTensor]): 输入 token IDs，形状为 (batch_size, sequence_length)。
+            attention_mask (Optional[torch.Tensor]): 注意力掩码，形状为 (batch_size, sequence_length)。
+            position_ids (Optional[torch.LongTensor]): 位置 IDs，形状为 (batch_size, sequence_length)。
+            past_key_values (Optional[Cache]): 过去的 key 和 value，用于加速推理。
+            inputs_embeds (Optional[torch.FloatTensor]): 输入嵌入，如果提供了 input_ids，则不需要提供 inputs_embeds。
+            use_cache (Optional[bool]): 是否使用缓存。
+            output_attentions (Optional[bool]): 是否输出注意力权重。
+            output_hidden_states (Optional[bool]): 是否输出隐藏状态。
+            cache_position (Optional[torch.LongTensor]): 缓存位置，用于更新缓存。
+            **flash_attn_kwargs:  Flash Attention 相关的关键字参数。
+
+        Returns:
+            BaseModelOutputWithPast: 包含 last_hidden_state, past_key_values, hidden_states, attentions 的对象。
+        """
+        # 1. 根据配置设置是否输出注意力和隐藏状态
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        #   - 如果 `output_attentions` 参数为 None，则使用模型配置中的 `output_attentions` 值。
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        #   - 如果 `output_hidden_states` 参数为 None，则使用模型配置中的 `output_hidden_states` 值。
 
+        # 2. 根据配置设置是否使用缓存
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        #   - 如果 `use_cache` 参数为 None，则使用模型配置中的 `use_cache` 值。
+
+        # 3. 检查是否只提供了一个输入：input_ids 或 inputs_embeds
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        #   -  `^` 是异或运算符，用于检查是否只提供了 `input_ids` 或 `inputs_embeds` 中的一个。
 
+        # 4. 梯度检查点和缓存不兼容，如果同时使用则给出警告
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once(
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
+        #   - 梯度检查点与缓存机制不兼容，如果同时启用，则关闭缓存以避免错误。
 
-        # TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
+        # 5. TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
+        # 检查 past_key_values 的类型是否正确
         if not isinstance(past_key_values, (type(None), Cache)):
             raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
+        #   - 确保 `past_key_values` 参数的类型为 `Cache` 对象或 None。
 
+        # 6. 如果没有提供 inputs_embeds，则使用嵌入层将 input_ids 转换为 inputs_embeds
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        #   - 如果没有直接提供嵌入向量 `inputs_embeds`，则使用嵌入层 `self.embed_tokens` 将 `input_ids` 转换为嵌入向量。
 
+        # 7. 如果使用缓存且没有提供 past_key_values，则创建一个 DynamicCache
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
+        #   - 如果启用了缓存 (`use_cache=True`) 且没有提供 `past_key_values`，则创建一个 `DynamicCache` 对象，用于存储和管理历史状态。
 
+        # 8. 如果没有提供 cache_position，则创建一个 cache_position
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
+        #   -  计算缓存的起始位置，并创建一个 `cache_position` 张量，用于指示当前输入在缓存中的位置。
 
+        # 9. 如果没有提供 position_ids，则使用 cache_position 创建一个 position_ids
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+        #    - 如果没有直接提供 `position_ids`，则使用 `cache_position` 张量创建一个 `position_ids` 张量，用于指定输入 token 的位置信息。
 
+        # 10. 更新因果掩码
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
+        #   - 根据输入、缓存和模型配置更新因果掩码，确保模型只能关注到当前位置之前的 token。
 
+        # 11. 隐藏状态，初始化为输入嵌入
         hidden_states = inputs_embeds
+        #   - 将 `hidden_states` 初始化为输入嵌入 `inputs_embeds`，作为 Transformer 解码器的输入。
 
-        # create position embeddings to be shared across the decoder layers
+        # 12. create position embeddings to be shared across the decoder layers
+        # 创建位置嵌入，用于编码位置信息
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        #   - 使用 `self.rotary_emb` 生成位置嵌入，编码输入的位置信息。
 
-        # decoder layers
+        # 13. decoder layers
+        # 所有隐藏状态，用于输出隐藏状态
         all_hidden_states = () if output_hidden_states else None
+        #   - 初始化一个空的元组，用于存储所有解码器层的隐藏状态。
+        # 所有自注意力权重，用于输出注意力权重
         all_self_attns = () if output_attentions else None
+        #   - 初始化一个空的元组，用于存储所有自注意力层的注意力权重。
 
+        # 14. 循环遍历所有解码器层
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            # 如果需要输出隐藏状态，则添加到 all_hidden_states 中
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # 计算解码器层的输出
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -573,18 +961,26 @@ class LlamaModel(LlamaPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **flash_attn_kwargs,
             )
+            #  - 将 `hidden_states` 传递给当前解码器层，并获取输出。
 
+            # 更新隐藏状态
             hidden_states = layer_outputs[0]
+            #   - 使用当前解码器层的输出更新 `hidden_states`，作为下一个解码器层的输入。
 
+            # 如果需要输出注意力权重，则添加到 all_self_attns 中
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        # 15. 对输出进行 RMSNorm 归一化
         hidden_states = self.norm(hidden_states)
+        #   - 使用 `self.norm` 对最后一个解码器层的输出进行归一化。
 
-        # add hidden states from the last decoder layer
+        # 16. add hidden states from the last decoder layer
+        # 如果需要输出隐藏状态，则添加到 all_hidden_states 中
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
+        # 17. 返回 BaseModelOutputWithPast
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
@@ -593,40 +989,64 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
     def _update_causal_mask(
-        self,
-        attention_mask: Union[torch.Tensor, "BlockMask"],
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool = False,
+            self,
+            attention_mask: Union[torch.Tensor, "BlockMask"],
+            input_tensor: torch.Tensor,
+            cache_position: torch.Tensor,
+            past_key_values: Cache,
+            output_attentions: bool = False,
     ):
+        """
+        更新因果注意力掩码。
+        该函数根据模型配置、输入张量、缓存状态和注意力掩码，生成或更新用于控制注意力计算的因果掩码。
+
+        Args:
+            attention_mask (Union[torch.Tensor, "BlockMask"]):
+                - 2D 注意力掩码，形状为 `(batch_size, key_value_length)`
+                - 或 4D 注意力掩码，形状为 `(batch_size, 1, query_length, key_value_length)`
+                - 或 `BlockMask` 对象 (用于 FlexAttention)。
+            input_tensor (torch.Tensor): 输入张量，形状为 `(batch_size, sequence_length, hidden_size)`。
+            cache_position (torch.Tensor): 指示输入序列 token 在序列中的位置的索引，形状为 `(sequence_length)`。
+            past_key_values (Cache): 用于存储过去 key 和 value 的缓存对象。
+            output_attentions (bool):  指示是否输出注意力权重。
+
+        Returns:
+            torch.Tensor: 更新后的因果注意力掩码，形状为 `(batch_size, 1, query_length, key_value_length)` 或 `BlockMask` (用于 FlexAttention)。如果不需要掩码，则返回 None。
+        """
+        # 1. 根据注意力实现方式选择处理逻辑
+        # 如果使用 flash_attention_2，且存在值为 0 的 attention_mask，则直接返回该 attention_mask；否则，返回 None
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
-            return None
+            return None  # flash_attention_2 会直接使用 attention_mask 或 is_causal 参数
+
+        # 如果使用 flex_attention，将 attention_mask 转换为 BlockMask 对象
         if self.config._attn_implementation == "flex_attention":
             if isinstance(attention_mask, torch.Tensor):
                 attention_mask = make_flex_block_causal_mask(attention_mask)
-            return attention_mask
+            return attention_mask  # flex_attention 使用 BlockMask 对象
 
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
+        # 2. 处理 SDPA 注意力机制
+        # SDPA 在某些情况下可以使用 is_causal 参数代替 attn_mask，以提升性能
+        # 获取已处理的 token 数量
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        # 检查是否使用了静态缓存
         using_static_cache = isinstance(past_key_values, StaticCache)
 
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        # 当 output attentions 为 True 时，sdpa 实现的前向方法调用 eager 实现的前向方法
         if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                is_training=self.training,
+                    attention_mask,
+                    inputs_embeds=input_tensor,
+                    past_key_values_length=past_seen_tokens,
+                    is_training=self.training,
             ):
-                return None
+                return None  # SDPA 且满足特定条件，则不使用 attn_mask
 
-        dtype = input_tensor.dtype
-        sequence_length = input_tensor.shape[1]
+        # 3. 准备因果掩码
+        dtype = input_tensor.dtype  # 获取输入张量的数据类型
+        sequence_length = input_tensor.shape[1]  # 获取输入张量的序列长度
         if using_static_cache:
             target_length = past_key_values.get_max_cache_shape()
         else:
@@ -635,8 +1055,12 @@ class LlamaModel(LlamaPreTrainedModel):
                 if isinstance(attention_mask, torch.Tensor)
                 else past_seen_tokens + sequence_length + 1
             )
+        #   -  计算目标序列长度 `target_length`，这取决于是否使用了静态缓存。
+        #       - 如果使用了静态缓存，则目标长度是缓存的最大长度。
+        #       - 否则，目标长度是已处理的 token 数量加上当前序列长度。
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        # 如果提供的 `attention` 掩码是 2D，则在这里生成一个因果掩码（4D）
         causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
             sequence_length=sequence_length,
@@ -645,19 +1069,23 @@ class LlamaModel(LlamaPreTrainedModel):
             cache_position=cache_position,
             batch_size=input_tensor.shape[0],
         )
+        #   - 调用 `_prepare_4d_causal_attention_mask_with_cache_position` 方法，根据输入信息生成 4D 因果掩码。
 
+        # 4. 特殊处理 SDPA 的因果掩码
         if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu", "npu"]
-            and not output_attentions
+                self.config._attn_implementation == "sdpa"
+                and attention_mask is not None
+                and attention_mask.device.type in ["cuda", "xpu", "npu"]
+                and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
             min_dtype = torch.finfo(dtype).min
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+        # - 为了兼容 F.scaled_dot_product_attention 的高效内存路径，需要对 causal_mask 中完全被掩码的行进行特殊处理，使它们可以 attend 到所有 token。
 
+        # 5. 返回因果掩码
         return causal_mask
 
     @staticmethod
@@ -720,40 +1148,110 @@ class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+    """
+    Llama 模型，用于因果语言建模 (Causal Language Modeling)。
+    用于生成文本，其任务是预测序列中的下一个 token。
+    该模型继承自 LlamaPreTrainedModel 和 GenerationMixin，从而获得了 Llama 模型的通用功能和文本生成能力。
+    """
+    # 1. Tied 权重键
     _tied_weights_keys = ["lm_head.weight"]
+    #   - `_tied_weights_keys`：指定需要进行权重绑定的键。
+    #   - 在因果语言模型中，通常将嵌入层（`embed_tokens`）和语言模型头（`lm_head`）的权重绑定在一起，以减少参数数量并提高性能。
+
+    # 2. 张量并行 (Tensor Parallelism) 计划
     _tp_plan = {"lm_head": "colwise_rep"}
+    #   - `_tp_plan`：指定在进行张量并行训练时，`lm_head` 模块的并行策略。
+    #   - `"colwise_rep"`：表示对 `lm_head` 的权重进行按列复制（colwise replication）。
+
+    # 3. Pipeline 并行 (Pipeline Parallelism) 计划
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    #   - `_pp_plan`：指定在进行流水线并行训练时，`lm_head` 模块的输入和输出。
+    #   - `(["hidden_states"], ["logits"])`：表示 `lm_head` 的输入是 `hidden_states`，输出是 `logits`。
 
     def __init__(self, config):
-        super().__init__(config)
-        self.model = LlamaModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        """
+        构造函数，初始化 LlamaForCausalLM。
 
-        # Initialize weights and apply final processing
+        Args:
+            config (LlamaConfig): 模型的配置对象。
+        """
+        super().__init__(config)  # 调用父类的构造函数，确保 LlamaPreTrainedModel 的初始化逻辑被执行。
+        # 1. Llama 模型
+        self.model = LlamaModel(config)
+        #   - 创建一个 LlamaModel 实例，作为因果语言模型的核心模块。
+
+        # 2. 词汇表大小
+        self.vocab_size = config.vocab_size
+        #   - 从模型配置中获取词汇表大小。
+
+        # 3. 语言模型头
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        #   - `lm_head`：一个线性层，用于将最后一个隐藏层的输出映射到词汇表大小，以预测下一个 token。
+        #   - 输入维度：`config.hidden_size`，即隐藏层的维度。
+        #   - 输出维度：`config.vocab_size`，即词汇表大小。
+        #   - `bias=False`：指示不使用偏置项。
+
+        # 4. 初始化权重和应用最终处理
         self.post_init()
+        #   - 调用 `post_init` 方法，初始化模型的权重，并将模型设置为评估模式。
 
     def get_input_embeddings(self):
-        return self.model.embed_tokens
+        """
+        获取输入嵌入。
+
+        Returns:
+            nn.Embedding: 输入嵌入层。
+        """
+        return self.model.embed_tokens  # 返回底层 LlamaModel 的嵌入层。
 
     def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        """
+        设置输入嵌入。
+
+        Args:
+            value (nn.Embedding): 新的嵌入层。
+        """
+        self.model.embed_tokens = value  # 将底层 LlamaModel 的嵌入层替换为新的嵌入层。
 
     def get_output_embeddings(self):
-        return self.lm_head
+        """
+        获取输出嵌入（即语言模型头）。
+
+        Returns:
+            nn.Linear: 语言模型头。
+        """
+        return self.lm_head  # 返回语言模型头。
 
     def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
+        """
+        设置输出嵌入（即语言模型头）。
+
+        Args:
+            new_embeddings (nn.Linear): 新的语言模型头。
+        """
+        self.lm_head = new_embeddings  # 将语言模型头替换为新的语言模型头。
 
     def set_decoder(self, decoder):
-        self.model = decoder
+        """
+        设置解码器。
+
+        Args:
+            decoder: 新的解码器。
+        """
+        self.model = decoder  # 将底层的 LlamaModel 替换为新的解码器。
 
     def get_decoder(self):
-        return self.model
+        """
+        获取解码器。
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+        Returns:
+            LlamaModel: 解码器。
+        """
+        return self.model  # 返回底层的 LlamaModel。
+
+    @can_return_tuple  # 指示该函数可以返回元组。
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)  # 添加输入文档字符串。
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)  # 替换返回文档字符串。
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -770,19 +1268,48 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
         r"""
+        前向传播函数，计算 LlamaForCausalLM 的输出。
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                输入序列 token 的索引。Padding 将默认被忽略。
+
+                Indices 可以使用 [`AutoTokenizer`] 获得。
+
+                [What are input IDs?](../glossary#input-ids)
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                用于避免在 padding token 索引上执行注意力计算的掩码。 掩码值 selected in `[0, 1]`:
+
+                - 1：表示 token **没有被掩码**，
+                - 0：表示 token **被掩码**。
+
+                [What are attention masks?](../glossary#attention-mask)
+
+                Indices 可以使用 [`AutoTokenizer`] 获得。
+
+                如果使用了 `past_key_values`，则可以选择只输入最后的 `input_ids`。
+
+            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                位置嵌入中每个输入序列 token 的位置索引。 选择范围在 `[0, config.n_positions - 1]` 内。
+
+                [What are position IDs?](../glossary#position-ids)
+            past_key_values (`Cache`, *optional*):
+                预先计算好的隐藏状态（自注意力模块中的 key 和 values），可以用于加速序列解码。 这通常由模型在解码的先前阶段返回的 `past_key_values` 组成，当 `use_cache=True` 或 `config.use_cache=True` 时。
+
+                It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+                如果使用了 `past_key_values`，用户可以选择只输入最后的 `input_ids`。
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+                可以选择不传递 `input_ids`，而是直接传递嵌入表示。
+
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+                用于计算 masked language modeling 损失的标签。索引应该在 `[0, ..., config.vocab_size]` 或 -100 内。
 
             logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
+                如果是一个 `int`，则计算最后 `logits_to_keep` 个 token 的 logits。如果为 0，则计算所有 `input_ids` 的 logits（特殊情况）。 只需要最后一个 token 的 logits 用于生成，并且只为该 token 计算它们可以节省内存，这对于长序列或大词汇量来说非常重要。 如果是一个 `torch.Tensor`，则必须是 1D 张量，对应于序列长度维度中要保留的索引。 这在使用 packed tensor 格式（批次和序列长度的单个维度）时很有用。
 
         Returns:
+            CausalLMOutputWithPast: 包含 loss, logits, past_key_values, hidden_states, attentions 的对象。
 
         Example:
 
@@ -800,12 +1327,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        # 1. 根据配置设置是否输出注意力和隐藏状态
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        #   - 如果 `output_attentions` 参数为 None，则使用模型配置中的 `output_attentions` 值。
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        #   - 如果 `output_hidden_states` 参数为 None，则使用模型配置中的 `output_hidden_states` 值。
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # 2. decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # 计算模型输出
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -818,16 +1349,35 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             **kwargs,
         )
+        #   - 调用底层的 LlamaModel 计算输出，并将结果存储在 `outputs` 变量中。
+        #   -  `outputs` 是一个 `BaseModelOutputWithPast` 对象，包含模型的各种输出，例如：
+        #       - `last_hidden_state`：最后一个隐藏层的输出。
+        #       - `past_key_values`：缓存的 key 和 value。
+        #       - `hidden_states`：所有隐藏层的输出（如果需要）。
+        #       - `attentions`：注意力权重（如果需要）。
 
+        # 3. 获取最后一个隐藏层的输出
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        #   - 从 `outputs` 中提取最后一个隐藏层的输出。
 
+        # 4. Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # 只计算需要的 logits，并且在不计算损失时不要将它们转换为 float 类型
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        #  -  根据 `logits_to_keep` 的值创建一个切片对象，用于选择需要计算 logits 的 token。
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        #   - 将 `hidden_states` 通过线性层 `lm_head` 映射到 logits 空间，得到每个 token 的预测概率。
+
+        # 5. 初始化损失
         loss = None
+        #   - 初始化损失变量为 None。
+
+        # 6. 如果提供了 labels，则计算损失
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        #   - 如果提供了标签 `labels`，则使用 `self.loss_function` 计算因果语言建模损失。
+        #   - `self.loss_function`：一个损失函数，用于衡量模型的预测结果与真实标签之间的差异。
 
+        # 7. 返回 CausalLMOutputWithPast
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -835,8 +1385,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
+        #   - 创建一个 `CausalLMOutputWithPast` 对象，并将损失、logits、缓存的 key 和 value、隐藏状态和注意力权重存储在该对象中。
+        #   -  `CausalLMOutputWithPast` 是一个数据结构，用于组织和返回因果语言模型的输出。
 @add_start_docstrings(
     """
     The LLaMa Model transformer with a sequence classification head on top (linear layer).
@@ -852,24 +1402,67 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     """,
     LLAMA_START_DOCSTRING,
 )
-class LlamaForSequenceClassification(LlamaPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = LlamaModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
-        # Initialize weights and apply final processing
+
+class LlamaForSequenceClassification(LlamaPreTrainedModel):
+    """
+    Llama 模型，用于序列分类任务。
+    该模型在 LLaMa 模型的基础上添加了一个序列分类头（线性层），用于将输入序列分类到不同的类别。
+    它继承自 LlamaPreTrainedModel，从而获得了 Llama 模型的通用功能，例如加载预训练权重、保存模型等。
+    该类适用于文本情感分析、主题分类等任务。
+    """
+    def __init__(self, config):
+        """
+        构造函数，初始化 LlamaForSequenceClassification。
+
+        Args:
+            config (LlamaConfig): 模型的配置对象，包含了模型结构、训练参数等信息。
+        """
+        super().__init__(config)  # 调用父类的构造函数，确保 LlamaPreTrainedModel 的初始化逻辑被执行，例如加载配置信息。
+
+        # 1. 标签数量
+        self.num_labels = config.num_labels
+        #   - `num_labels`：指定分类任务的标签数量，例如情感分析任务的标签数量可以是 2（正面、负面）或 3（正面、负面、中性）。
+        #   - 该参数从 LlamaConfig 中获取，需要在配置对象中预先定义。
+
+        # 2. Llama 模型
+        self.model = LlamaModel(config)
+        #   - `model`：创建一个 LlamaModel 实例，作为序列分类任务的基础模型。
+        #   - LlamaModel 负责处理输入序列，并生成隐藏状态表示。
+
+        # 3. 线性分类层 (也称为 "scoring" 层或 "classification head")
+        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        #   - `score`：一个线性层，用于将最后一个隐藏层的输出（表示整个序列的特征）映射到标签数量，以进行分类。
+        #   - 输入维度：`config.hidden_size`，即 LlamaModel 最后一个隐藏层的维度，代表了整个序列的特征向量。
+        #   - 输出维度：`self.num_labels`，即标签数量，每个维度对应一个类别的得分。
+        #   - `bias=False`：指示不使用偏置项。在某些情况下，去除偏置项可以提高模型性能。
+        #   - 线性层的输出通常会经过 Softmax 函数进行归一化，得到每个类别的概率。
+
+        # 4. 初始化权重和应用最终处理
         self.post_init()
+        #   - 调用 `post_init` 方法，初始化模型的权重，并将模型设置为评估模式。
+        #   -  `post_init` 方法是 PreTrainedModel 类提供的一个钩子函数，用于执行模型初始化后的操作。
 
     def get_input_embeddings(self):
-        return self.model.embed_tokens
+        """
+        获取输入嵌入。
+
+        Returns:
+            nn.Embedding: 输入嵌入层。
+        """
+        return self.model.embed_tokens  # 返回底层 LlamaModel 的嵌入层，用于将 token 转换为向量表示。
 
     def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        """
+        设置输入嵌入。
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+        Args:
+            value (nn.Embedding): 新的嵌入层。
+        """
+        self.model.embed_tokens = value  # 将底层 LlamaModel 的嵌入层替换为新的嵌入层，用于替换模型的词汇表或调整嵌入维度。
+
+    @can_return_tuple  # 指示该函数可以返回元组，允许用户根据需要选择返回哪些信息。
+    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)  # 添加输入文档字符串，从 LLAMA_INPUTS_DOCSTRING 常量中获取。
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -883,12 +1476,33 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
     ) -> SequenceClassifierOutputWithPast:
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
+        前向传播函数，计算 LlamaForSequenceClassification 的输出，执行序列分类任务的核心逻辑。
 
+        Args:
+            input_ids (Optional[torch.LongTensor]): 输入序列 token 的索引，形状为 (batch_size, sequence_length)。
+            attention_mask (Optional[torch.Tensor]): 注意力掩码，形状为 (batch_size, sequence_length)。
+            position_ids (Optional[torch.LongTensor]): 位置 IDs，形状为 (batch_size, sequence_length)。
+            past_key_values (Optional[Cache]): 过去的 key 和 value，用于加速推理 (仅在 use_cache=True 时有效)。
+            inputs_embeds (Optional[torch.FloatTensor]): 输入嵌入，如果提供了 input_ids，则不需要提供 inputs_embeds。
+            labels (Optional[torch.LongTensor]): 用于计算序列分类/回归损失的标签，形状为 (batch_size,)。
+                - 对于分类任务，每个值代表一个类别的索引。
+                - 对于回归任务，每个值代表一个连续的目标值。
+            use_cache (Optional[bool]): 是否使用缓存，用于加速推理。
+            output_attentions (Optional[bool]): 是否输出注意力权重，用于可视化或分析模型行为。
+            output_hidden_states (Optional[bool]): 是否输出隐藏状态，用于获取中间层特征。
+
+        Returns:
+            SequenceClassifierOutputWithPast: 包含 loss, logits, past_key_values, hidden_states, attentions 的对象。
+            - loss: 如果提供了 labels，则返回计算得到的损失值，否则返回 None。
+            - logits: 模型输出的 logits，形状为 (batch_size, num_labels)，表示每个类别的得分。
+            - past_key_values:  如果 use_cache=True，则返回缓存的 key 和 value，用于加速后续的生成过程。
+            - hidden_states: 如果 output_hidden_states=True，则返回所有隐藏层的输出，用于获取中间层特征。
+            - attentions: 如果 output_attentions=True，则返回所有注意力层的权重，用于可视化或分析模型行为。
+        """
+        # r""" 用于创建原始字符串，可以包含特殊字符而无需转义。
+        #  -  这段注释使用了 reStructuredText 格式，用于生成文档。
+
+        # 1. 计算 Llama 模型的输出，将输入传递给底层的 LlamaModel
         transformer_outputs: BaseModelOutputWithPast = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -899,36 +1513,68 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
         )
-        hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
+        #   - 将输入传递给底层的 LlamaModel，进行编码，得到 Transformer 模型的输出。
+        #   - `transformer_outputs`：包含 LlamaModel 的输出，是一个 BaseModelOutputWithPast 对象。
 
+        # 2. 获取最后一个隐藏层的输出，作为序列的整体表示
+        hidden_states = transformer_outputs.last_hidden_state
+        #   - 从 Transformer 模型的输出中提取最后一个隐藏层的输出。
+        #   -  `hidden_states`：形状为 (batch_size, sequence_length, hidden_size)，表示每个 token 的隐藏状态。
+
+        # 3. 使用线性分类层进行分类，将序列表示映射到 logits
+        logits = self.score(hidden_states)
+        #   - 将最后一个隐藏层的输出通过线性层 `self.score` 映射到 logits 空间，得到每个类别的预测分数。
+        #   - `logits`：形状为 (batch_size, sequence_length, num_labels)，表示每个 token 对不同类别的预测得分。
+
+        # 4. 获取 batch_size，用于后续的计算
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
             batch_size = inputs_embeds.shape[0]
+        #   -  根据是否提供了 input_ids 或 inputs_embeds 来确定 batch size。
 
+        # 5. 确定用于分类的 token，需要考虑 padding 的情况
         if self.config.pad_token_id is None and batch_size != 1:
             raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        #   - 如果没有定义 `pad_token_id` 且 `batch_size` 大于 1，则抛出 ValueError，因为无法确定使用哪个 token 进行分类。
+        #   - 这通常发生在处理变长序列且没有指定 padding token 的情况下。
         if self.config.pad_token_id is None:
             last_non_pad_token = -1
+        #   - 如果没有定义 `pad_token_id`，则使用最后一个 token 进行分类。
         elif input_ids is not None:
             # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
+            # 为了处理左侧和右侧的 padding，我们获取最右侧的不等于 pad_token_id 的 token
             non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
             token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
             last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+        #   - 如果定义了 `pad_token_id`，则找到每个序列中最后一个非 padding token 的位置。
+        #   -  `non_pad_mask`：形状为 (batch_size, sequence_length)，用于指示哪些 token 是非 padding token。
+        #   -  `token_indices`：形状为 (sequence_length)，表示 token 的位置索引。
+        #   -  `last_non_pad_token`：形状为 (batch_size,)，表示每个序列中最后一个非 padding token 的位置索引。
         else:
             last_non_pad_token = -1
             logger.warning_once(
                 f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
             )
+        #   - 如果没有提供 `input_ids`，只有 `inputs_embeds`, 则使用最后一个 token 进行分类，并给出警告，因为无法检测 padding token。
 
+        # 6. 获取用于分类的 logits
         pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+        #   - 从 `logits` 中提取用于分类的 token 的 logits。
+        #   -  `pooled_logits`：形状为 (batch_size, num_labels)，表示每个序列的分类得分。
 
+        # 7. 初始化损失
         loss = None
+        #   - 初始化损失变量为 None。
+
+        # 8. 如果提供了 labels，则计算损失
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
+        #   - 如果提供了标签 `labels`，则使用 `self.loss_function` 计算序列分类损失。
+        #   -  `self.loss_function`：负责计算损失，根据任务类型（分类或回归）选择合适的损失函数，例如交叉熵损失或均方误差损失。
 
+        # 9. 返回 SequenceClassifierOutputWithPast
         return SequenceClassifierOutputWithPast(
             loss=loss,
             logits=pooled_logits,
@@ -936,6 +1582,8 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+        #   - 创建一个 `SequenceClassifierOutputWithPast` 对象，并将损失、logits、缓存的 key 和 value、隐藏状态和注意力权重存储在该对象中。
+        #   -  `SequenceClassifierOutputWithPast` 是一个数据结构，用于组织和返回序列分类任务的输出结果。
 
 
 @add_start_docstrings(

@@ -12,26 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-from shutil import copyfile
-from typing import Optional, Tuple
+import os  # 导入os模块，用于文件和目录操作
+from shutil import copyfile  # 导入copyfile函数，用于复制文件
+from typing import Optional, Tuple  # 导入Optional和Tuple类型，用于类型提示
 
-from tokenizers import processors
+from tokenizers import processors  # 导入processors模块，用于后处理
 
-from ...tokenization_utils_fast import PreTrainedTokenizerFast
-from ...utils import is_sentencepiece_available, logging
+from ...tokenization_utils_fast import PreTrainedTokenizerFast  # 导入PreTrainedTokenizerFast类，作为快速分词器的基类
+from ...utils import is_sentencepiece_available, logging  # 导入工具函数和logging模块
 
 
-if is_sentencepiece_available():
-    from .tokenization_llama import LlamaTokenizer
+if is_sentencepiece_available():  # 检查是否安装了sentencepiece
+    from .tokenization_llama import LlamaTokenizer  # 如果安装了sentencepiece，导入LlamaTokenizer (慢速版本)
 else:
-    LlamaTokenizer = None
+    LlamaTokenizer = None  # 如果没有安装sentencepiece，将LlamaTokenizer设置为None
 
-logger = logging.get_logger(__name__)
-VOCAB_FILES_NAMES = {"vocab_file": "tokenizer.model", "tokenizer_file": "tokenizer.json"}
+logger = logging.get_logger(__name__)  # 获取logger实例
+VOCAB_FILES_NAMES = {"vocab_file": "tokenizer.model", "tokenizer_file": "tokenizer.json"}  # 定义词汇表文件名称
 
-B_INST, E_INST = "[INST]", "[/INST]"
-B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
+B_INST, E_INST = "[INST]", "[/INST]"  # Instruction开始和结束标记
+B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"  # System prompt开始和结束标记
 
 # fmt: off
 DEFAULT_SYSTEM_PROMPT = """You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your \
@@ -100,7 +100,7 @@ class LlamaTokenizerFast(PreTrainedTokenizerFast):
             >>> from transformers import LlamaTokenizerFast
 
             >>> tokenizer = LlamaTokenizerFast.from_pretrained("huggyllama/llama-7b", legacy=True, from_slow=True)
-            >>> tokenizer.encode("Hello <s>.") # 869 is '▁.'
+            >>> tokenizer.encode("Hello <s>.") # 869 is ' .'
             [1, 15043, 29871, 1, 869]
             ```
             - `legacy=False`:
@@ -116,10 +116,10 @@ class LlamaTokenizerFast(PreTrainedTokenizerFast):
             Whether or not the tokenizer should automatically add a prefix space
     """
 
-    vocab_files_names = VOCAB_FILES_NAMES
-    slow_tokenizer_class = LlamaTokenizer
-    padding_side = "left"
-    model_input_names = ["input_ids", "attention_mask"]
+    vocab_files_names = VOCAB_FILES_NAMES  # 词汇表文件名称
+    slow_tokenizer_class = LlamaTokenizer  # 对应的慢速tokenizer类
+    padding_side = "left"  # padding方向
+    model_input_names = ["input_ids", "attention_mask"]  # 模型期望的输入名称
 
     def __init__(
         self,
@@ -136,6 +136,23 @@ class LlamaTokenizerFast(PreTrainedTokenizerFast):
         add_prefix_space=None,
         **kwargs,
     ):
+        """
+        初始化LlamaTokenizerFast。
+
+        Args:
+            vocab_file: SentencePiece 词汇表文件路径.
+            tokenizer_file:  tokenizer.json 文件路径.
+            clean_up_tokenization_spaces:  是否在解码后清理空格.
+            unk_token:  未知token.
+            bos_token:  句子开始token.
+            eos_token:  句子结束token.
+            add_bos_token:  是否在序列开始添加bos_token.
+            add_eos_token:  是否在序列末尾添加eos_token.
+            use_default_system_prompt: 是否使用默认的系统prompt.
+            legacy: 是否使用旧版本tokenizer的行为方式.
+            add_prefix_space: 是否在文本前自动添加前缀空格.
+            **kwargs: 其他参数，传递给父类初始化函数。
+        """
         if legacy is None:
             logger.warning_once(
                 f"You are using the default legacy behaviour of the {self.__class__}. This is"
@@ -145,13 +162,13 @@ class LlamaTokenizerFast(PreTrainedTokenizerFast):
                 " https://github.com/huggingface/transformers/pull/24565 - if you loaded a llama tokenizer from a GGUF file"
                 " you can ignore this message."
             )
-            legacy = True
-        self.legacy = legacy
+            legacy = True  # 如果未指定legacy，则设置为True (旧版本行为)
+        self.legacy = legacy  # 存储legacy参数
 
         if add_prefix_space is not None:
-            kwargs["from_slow"] = True
+            kwargs["from_slow"] = True  # 如果指定了add_prefix_space, 则强制使用from_slow=True
 
-        super().__init__(
+        super().__init__(  # 调用父类PreTrainedTokenizerFast的构造函数
             vocab_file=vocab_file,
             tokenizer_file=tokenizer_file,
             clean_up_tokenization_spaces=clean_up_tokenization_spaces,
@@ -165,91 +182,139 @@ class LlamaTokenizerFast(PreTrainedTokenizerFast):
             legacy=legacy,
             **kwargs,
         )
-        self._add_bos_token = add_bos_token
-        self._add_eos_token = add_eos_token
-        self.update_post_processor()
-        self.use_default_system_prompt = use_default_system_prompt
-        self.vocab_file = vocab_file
+        self._add_bos_token = add_bos_token  # 存储是否添加bos token
+        self._add_eos_token = add_eos_token  # 存储是否添加eos token
+        self.update_post_processor()  # 更新后处理器
+        self.use_default_system_prompt = use_default_system_prompt  # 存储是否使用默认系统prompt
+        self.vocab_file = vocab_file  # 存储词汇表文件路径
 
     @property
     def can_save_slow_tokenizer(self) -> bool:
-        return os.path.isfile(self.vocab_file) if self.vocab_file else False
+        """
+        检查是否可以保存慢速tokenizer。
+        Returns:
+            bool:  如果存在vocab_file则返回True，否则返回False.
+        """
+        return os.path.isfile(self.vocab_file) if self.vocab_file else False  # 如果存在vocab_file则返回True，否则返回False
 
     def update_post_processor(self):
         """
-        Updates the underlying post processor with the current `bos_token` and `eos_token`.
+        更新底层的post processor，使用当前的`bos_token`和`eos_token`.
+
+        后处理器负责在分词后添加特殊token。
         """
-        bos = self.bos_token
-        bos_token_id = self.bos_token_id
-        if bos is None and self.add_bos_token:
+        bos = self.bos_token  # 获取bos token
+        bos_token_id = self.bos_token_id  # 获取bos token id
+        if bos is None and self.add_bos_token:  # 如果bos token为None且需要添加bos token，则抛出异常
             raise ValueError("add_bos_token = True but bos_token = None")
 
-        eos = self.eos_token
-        eos_token_id = self.eos_token_id
-        if eos is None and self.add_eos_token:
+        eos = self.eos_token  # 获取eos token
+        eos_token_id = self.eos_token_id  # 获取eos token id
+        if eos is None and self.add_eos_token:  # 如果eos token为None且需要添加eos token，则抛出异常
             raise ValueError("add_eos_token = True but eos_token = None")
 
-        single = f"{(bos + ':0 ') if self.add_bos_token else ''}$A:0{(' ' + eos + ':0') if self.add_eos_token else ''}"
-        pair = f"{single}{(' ' + bos + ':1') if self.add_bos_token else ''} $B:1{(' ' + eos + ':1') if self.add_eos_token else ''}"
+        single = f"{(bos + ':0 ') if self.add_bos_token else ''}$A:0{(' ' + eos + ':0') if self.add_eos_token else ''}"  # 构建single template
+        pair = f"{single}{(' ' + bos + ':1') if self.add_bos_token else ''} $B:1{(' ' + eos + ':1') if self.add_eos_token else ''}"  # 构建pair template
 
-        special_tokens = []
-        if self.add_bos_token:
+        special_tokens = []  # 存储特殊token
+        if self.add_bos_token:  # 如果需要添加bos token，则添加到special_tokens
             special_tokens.append((bos, bos_token_id))
-        if self.add_eos_token:
+        if self.add_eos_token:  # 如果需要添加eos token，则添加到special_tokens
             special_tokens.append((eos, eos_token_id))
-        self._tokenizer.post_processor = processors.TemplateProcessing(
+        self._tokenizer.post_processor = processors.TemplateProcessing(  # 创建TemplateProcessing对象并设置为tokenizer的post_processor
             single=single, pair=pair, special_tokens=special_tokens
         )
 
     @property
     def add_eos_token(self):
-        return self._add_eos_token
+        """
+        返回是否添加eos token.
+        """
+        return self._add_eos_token  # 返回是否添加eos token
 
     @property
     def add_bos_token(self):
-        return self._add_bos_token
+        """
+        返回是否添加bos token.
+        """
+        return self._add_bos_token  # 返回是否添加bos token
 
     @add_eos_token.setter
     def add_eos_token(self, value):
-        self._add_eos_token = value
-        self.update_post_processor()
+        """
+        设置是否添加eos token。
+
+        Args:
+            value: 是否添加eos token。
+        """
+        self._add_eos_token = value  # 设置是否添加eos token
+        self.update_post_processor()  # 更新后处理器
 
     @add_bos_token.setter
     def add_bos_token(self, value):
-        self._add_bos_token = value
-        self.update_post_processor()
+        """
+        设置是否添加bos token。
+
+        Args:
+            value: 是否添加bos token。
+        """
+        self._add_bos_token = value  # 设置是否添加bos token
+        self.update_post_processor()  # 更新后处理器
 
     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
-        if not self.can_save_slow_tokenizer:
+        """
+        将词汇表保存到指定目录。
+
+        Args:
+            save_directory: 保存目录。
+            filename_prefix: 文件名前缀。
+
+        Returns:
+            保存的词汇表文件路径的元组。
+
+        Raises:
+            ValueError: 如果无法保存慢速tokenizer。
+        """
+        if not self.can_save_slow_tokenizer:  # 如果无法保存慢速tokenizer，则抛出异常
             raise ValueError(
                 "Your fast tokenizer does not have the necessary information to save the vocabulary for a slow "
                 "tokenizer."
             )
 
-        if not os.path.isdir(save_directory):
+        if not os.path.isdir(save_directory):  # 如果保存目录不是目录，则输出错误信息并返回
             logger.error(f"Vocabulary path ({save_directory}) should be a directory")
             return
-        out_vocab_file = os.path.join(
+        out_vocab_file = os.path.join(  # 构建输出词汇表文件路径
             save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
         )
 
-        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
+        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):  # 如果词汇表文件路径与输出词汇表文件路径不同，则复制词汇表文件
             copyfile(self.vocab_file, out_vocab_file)
 
-        return (out_vocab_file,)
+        return (out_vocab_file,)  # 返回输出词汇表文件路径
 
     # TODO ArthurZ let's rely on the template processor instead, refactor all fast tokenizers
     # Copied from transformers.models.llama.tokenization_llama.LlamaTokenizer.build_inputs_with_special_tokens
     def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-        bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-        eos_token_id = [self.eos_token_id] if self.add_eos_token else []
+        """
+        将特殊token添加到输入token ids中。
 
-        output = bos_token_id + token_ids_0 + eos_token_id
+        Args:
+            token_ids_0: 第一个序列的token ids。
+            token_ids_1: 第二个序列的token ids (可选).
 
-        if token_ids_1 is not None:
+        Returns:
+            包含特殊token的token ids列表。
+        """
+        bos_token_id = [self.bos_token_id] if self.add_bos_token else []  # 获取bos token id列表
+        eos_token_id = [self.eos_token_id] if self.add_eos_token else []  # 获取eos token id列表
+
+        output = bos_token_id + token_ids_0 + eos_token_id  # 将bos token id、token_ids_0和eos token id拼接在一起
+
+        if token_ids_1 is not None:  # 如果存在token_ids_1，则将bos token id、token_ids_1和eos token id拼接在一起
             output = output + bos_token_id + token_ids_1 + eos_token_id
 
-        return output
+        return output  # 返回包含特殊token的token ids列表
 
 
-__all__ = ["LlamaTokenizerFast"]
+__all__ = ["LlamaTokenizerFast"]  # 定义可以被import * 导入的变量
