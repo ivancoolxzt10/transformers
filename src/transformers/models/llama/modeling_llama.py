@@ -68,67 +68,211 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 
 
 @use_kernel_forward_from_hub("RMSNorm")
+# LlamaRMSNorm 是一个实现均方根层归一化 (Root Mean Square Layer Normalization) 的模块。
+# 这是一个 Hugging Face 特有的装饰器，用于性能优化。
+# 它的作用是：如果 Hugging Face Hub 上存在一个为 RMSNorm 编写的、预编译的、
+# 高度优化的“核函数”（例如用 Triton 或 CUDA 编写的），
+# 那么在调用 forward 方法时，就会自动使用那个快速的核函数，而不是下面我们定义的这个 Python 版本。
+# 如果找不到优化核，它会优雅地回退，执行下面的 Python forward 代码。
+# 这是一个可选的性能增强功能。
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
         LlamaRMSNorm is equivalent to T5LayerNorm
+        文档字符串：LlamaRMSNorm 与 T5LayerNorm 是等价的。
         """
+        # 调用父类 nn.Module 的构造函数，这是 PyTorch 模块的标准写法。
         super().__init__()
+
+        # 定义一个可学习的参数 `weight`。
+        # nn.Parameter() 会将一个张量注册为模型的参数，这意味着在训练期间，
+        # PyTorch 的自动求导机制会计算它的梯度，并且优化器会更新它的值。
+        # torch.ones(hidden_size) 将其初始化为全1的向量，形状与输入的隐藏层维度相同。
+        # 初始化为1意味着在训练开始时，这个层不会改变输入向量的尺度。
         self.weight = nn.Parameter(torch.ones(hidden_size))
+
+        # 定义一个非常小的常数 epsilon，用于防止除以零。
+        # 在计算方差的平方根时，如果方差恰好为0，加上这个小的 epsilon 可以保证分母不为0，
+        # 从而避免计算出 NaN (Not a Number) 或 Inf (Infinity)，保证数值稳定性。
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        # 1. 准备工作：保存原始数据类型，并将输入转换为 float32 进行计算
+
+        # 保存输入张量 hidden_states 的原始数据类型（如 float16 或 bfloat16）。
         input_dtype = hidden_states.dtype
+
+        # 将 hidden_states 转换为 float32 类型。
+        # 这是为了提高计算过程中的数值精度，尤其是在进行 pow(2) 和 mean 操作时，
+        # 使用 float32 可以防止数值下溢或上溢，得到更准确的方差。
         hidden_states = hidden_states.to(torch.float32)
+
+        # 2. 计算 RMS (Root Mean Square)
+
+        # hidden_states.pow(2): 对 hidden_states 中的每个元素进行平方（Square）。
+        # .mean(-1, keepdim=True): 沿着最后一个维度（即特征维度）计算均值（Mean）。
+        # `keepdim=True` 是一个关键参数，它让输出的维度得以保留。例如，如果输入形状是 [batch, seq_len, hidden_size]，
+        # 那么计算均值后的形状将是 [batch, seq_len, 1] 而不是 [batch, seq_len]。
+        # 这对于下一步的广播（broadcasting）除法至关重要。
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+
+        # 3. 归一化输入
+
+        # torch.rsqrt(x) 是一个高效的函数，用于计算 1 / sqrt(x) (即平方根的倒数, "rsqrt")。
+        # `variance + self.variance_epsilon` 就是加上之前定义的 epsilon 来防止除零。
+        # `hidden_states * torch.rsqrt(...)` 在数学上等价于 `hidden_states / torch.sqrt(...)`。
+        # 由于 variance 的形状是 [..., 1]，而 hidden_states 是 [..., hidden_size]，
+        # PyTorch 会利用广播机制，将 variance 的值应用到 hidden_states 的每一个特征上。
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        # 4. 应用可学习的增益（gain）并恢复原始数据类型
+
+        # 将归一化后的 hidden_states 乘以可学习的 `weight` 参数。
+        # 这允许模型在训练中学习如何动态地调整每个特征维度的尺度（"伸缩"），
+        # 恢复或增强那些在归一化过程中可能被抑制的重要信息。
+        # 最后，使用 .to(input_dtype) 将计算结果转换回原始的数据类型，以节省内存并与模型的其他部分保持一致。
         return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
+        # 这是一个辅助函数，用于自定义模块的打印输出信息。
+        # 当你打印这个模块实例时（例如 `print(my_rms_norm)`），
+        # 它会返回一个字符串，附加到默认的类名后面。
+        # 这里的实现会显示 weight 的形状和 epsilon 的值，
+        # 例如，输出会像这样：`LlamaRMSNorm((768,), eps=1e-06)`，非常便于调试。
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
-
+# 该模块接收一个输入张量 x（主要用于获取设备和数据类型）和对应的 position_ids（表示每个token在序列中的位置），
+# 然后计算并返回这两个位置上对应的旋转角度的余弦和正弦值。这些 cos 和 sin 值随后会在注意力模块中与Query和Key向量相乘，以注入位置信息。
+# 这个类的一个关键特性是它支持上下文窗口扩展技术（如 YaRN、Linear Scaling 等），允许模型处理比原始训练时更长的序列。
 class LlamaRotaryEmbedding(nn.Module):
     def __init__(self, config: LlamaConfig, device=None):
         super().__init__()
-        # BC: "rope_type" was originally "type"
+
+        # 1. 确定RoPE的扩展类型（Rope Scaling Type）
+        # BC: "rope_type" was originally "type"  (BC代表向后兼容 "Backward Compatibility")
+        # 检查配置文件中是否存在 'rope_scaling' 字典。这个字典包含了长上下文扩展的配置。
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            # 从字典中获取扩展类型。优先使用 "rope_type" 键，如果不存在，则使用旧的 "type" 键，以保持向后兼容。
             self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
         else:
+            # 如果没有配置 'rope_scaling'，则使用默认的RoPE实现。
             self.rope_type = "default"
+
+        # 2. 存储原始和当前的最大序列长度
+        # 'max_position_embeddings' 是模型在训练时支持的最大上下文长度。
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+
+        # 3. 选择并执行RoPE初始化函数
+        # ROPE_INIT_FUNCTIONS 是一个字典，将 "default", "yarn", "linear" 等字符串映射到具体的初始化函数上。
+        # 这里根据之前确定的 self.rope_type，选择一个合适的函数。
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
+        # 4. 调用初始化函数，计算逆频率 (inv_freq) 和注意力缩放因子 (attention_scaling)
+        # 这个初始化函数会根据选择的扩展方法（如YaRN）来计算RoPE的核心参数。
+        # inv_freq: 逆频率，即 RoPE 公式中的 1 / (theta^(2i/d))。不同的扩展方法会修改 theta 或直接调整这些频率。
+        # attention_scaling: 注意力缩放因子。对于YaRN等方法，除了调整频率，还需要对最终的cos/sin值进行缩放，以稳定注意力分数。
+        #                    对于默认的RoPE，这个值通常是1.0。
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
 
-    @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+        # 5. 将 inv_freq 注册为模型的缓冲区 (buffer)
+        # register_buffer: 告诉PyTorch将 inv_freq 作为模型状态的一部分（例如，它会随模型一起移动到GPU），
+        #                 但它不是一个可学习的参数（即不会计算梯度）。
+        # persistent=False: 表示在保存模型状态字典 (state_dict) 时，不保存这个缓冲区。
+        #                 这可以节省磁盘空间，因为它可以根据config在加载时重新计算出来。
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq  # 保存一份原始的inv_freq，可能用于某些动态调整的场景。
+
+    @torch.no_grad()  # 装饰器：表示该函数内的所有操作都不需要计算梯度。因为RoPE是固定的数学变换，这能提升效率。
+    @dynamic_rope_update  # 装饰器：一个为高级用户设计的功能，用于处理动态RoPE类型。
+    # 它可能会检查当前请求的上下文长度是否超过了缓存的长度，如果超过，则重新运行初始化函数以更新inv_freq。
     def forward(self, x, position_ids):
+        # 1. 扩展 inv_freq 和 position_ids 的维度以进行矩阵乘法
+
+        # self.inv_freq 的原始形状是 [head_dim / 2]。
+        # [None, :, None] 操作后变为 [1, head_dim / 2, 1]。
+        # .expand(...) 操作将其扩展到批次大小，形状变为 [batch_size, head_dim / 2, 1]。
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+
+        # position_ids 的原始形状是 [batch_size, seq_len]。
+        # [:, None, :] 操作后变为 [batch_size, 1, seq_len]。
         position_ids_expanded = position_ids[:, None, :].float()
 
+        # 2. 在高精度(float32)下计算旋转角度
+
+        # 检查设备类型，以确保在所有设备上都能安全地禁用混合精度。
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+        # torch.autocast: 这是一个上下文管理器，用于自动混合精度训练（如使用float16）。
+        # enabled=False: 在这个代码块中，我们强制禁用混合精度，所有计算都使用float32。
+        # 为什么？因为旋转角度的计算对数值精度敏感，使用低精度可能导致误差累积和模型性能下降。
+        with torch.autocast(device_type=device_type, enabled=False):
+            # 3. 核心计算：矩阵乘法得到频率 * 位置 = 角度
+            # (inv_freq @ position_ids) 计算出每个维度在每个位置上的旋转角度。
+            # 结果 freqs 的形状是 [batch_size, head_dim / 2, seq_len]。
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+
+            # 4. 准备完整的角度张量
+            # RoPE中，成对的维度使用相同的旋转角度。这里通过拼接(cat)将角度复制一份。
+            # 结果 emb 的形状变为 [batch_size, seq_len, head_dim]。
             emb = torch.cat((freqs, freqs), dim=-1)
+
+            # 5. 计算cos和sin，并应用缩放因子
+            # `emb.cos()` 逐元素计算余弦值。
+            # `* self.attention_scaling` 应用之前从初始化函数中获得的缩放因子（对YaRN等方法至关重要）。
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
+        # 6. 将结果转换回原始数据类型并返回
+        # `to(dtype=x.dtype)` 确保输出的cos/sin张量与模型其他部分的类型一致（如bfloat16）。
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
+    # 函数文档字符串：旋转输入的一半隐藏维度。
+
+    # ----------------------------------------------------------------------------------
+    # 第1行：切分出张量的前半部分
+    # ----------------------------------------------------------------------------------
+    # `x` 是输入的张量，它可以有任意数量的维度（例如 [batch, heads, seq, dim]）。
+    # `...` (省略号) 是 PyTorch/NumPy 的一个特性，意思是“选中所有前面的维度”。
+    # `x.shape[-1]` 获取最后一个维度（即特征/头维度）的大小。
+    # `// 2` 执行整数除法，找到中点。
+    # 因此，`x[..., : x.shape[-1] // 2]` 选中了从开头到最后一个维度中点的所有数据。
+    # 如果 x 是 [10, 20, 30, 40]，那么 x1 就是 [10, 20]。
+    # 这个变量 `x1` 代表了我们概念中2D向量的所有 "x" 分量。
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+
+    # ----------------------------------------------------------------------------------
+    # 第2行：切分出张量的后半部分
+    # ----------------------------------------------------------------------------------
+    # 这与上一行类似。
+    # 切片 `x.shape[-1] // 2 :` 的意思是“从中点到结尾”。
+    # 如果 x 是 [10, 20, 30, 40]，那么 x2 就是 [30, 40]。
+    # 这个变量 `x2` 代表了我们概念中2D向量的所有 "y" 分量。
+    x2 = x[..., x.shape[-1] // 2:]
+
+    # ----------------------------------------------------------------------------------
+    # 第3行：取反、交换和拼接
+    # ----------------------------------------------------------------------------------
+    # 这是实现 `[-y, x]` 变换的核心操作。
+    #
+    # 1. `-x2`: 对张量的后半部分 (`x2`) 进行逐元素取反。
+    #    如果 x2 是 [30, 40]，`-x2` 就变成了 [-30, -40]。这就是 `"-y"` 部分。
+    #
+    # 2. `x1`: 这是原始、未改变的前半部分。
+    #    如果 x1 是 [10, 20]，它依然是 [10, 20]。这就是 `"x"` 部分。
+    #
+    # 3. `torch.cat((...), dim=-1)`: 沿最后一个维度 (`dim=-1`) 拼接元组 `(-x2, x1)` 中的张量。
+    #    这里的顺序至关重要：`-x2` 在前，`x1` 在后。
+    #    所以，它会将 [-30, -40] 和 [10, 20] 组合起来，生成最终的张量 [-30, -40, 10, 20]。
+    #
+    # 最终结果是一个新的张量，其原始的后半部分被取反并放在了开头，而原始的前半部分被放在了结尾。
+    # 这就完美地创建了RoPE所需的“伙伴”向量。
     return torch.cat((-x2, x1), dim=-1)
 
 
