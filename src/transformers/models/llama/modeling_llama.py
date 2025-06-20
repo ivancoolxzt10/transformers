@@ -927,6 +927,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # 1. 嵌入层
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        #     shape: (vocab_size, hidden_size)
         #   - `nn.Embedding`：将输入 token IDs 转换为连续的向量表示。
         #   - `config.vocab_size`：词汇表大小。
         #   - `config.hidden_size`：嵌入向量的维度。
@@ -1057,12 +1058,13 @@ class LlamaModel(LlamaPreTrainedModel):
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-        #   -  计算缓存的起始位置，并创建一个 `cache_position` 张量，用于指示当前输入在缓存中的位置。
+
+        #   -  (sequence_length,)计算缓存的起始位置，并创建一个 `cache_position` 张量，用于指示当前输入在缓存中的位置。
 
         # 9. 如果没有提供 position_ids，则使用 cache_position 创建一个 position_ids
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        #    - 如果没有直接提供 `position_ids`，则使用 `cache_position` 张量创建一个 `position_ids` 张量，用于指定输入 token 的位置信息。
+        #  position_ids shape   (1, sequence_length) -   如果没有直接提供 `position_ids`，则使用 `cache_position` 张量创建一个 `position_ids` 张量，用于指定输入 token 的位置信息。
 
         # 10. 更新因果掩码
         causal_mask = self._update_causal_mask(
